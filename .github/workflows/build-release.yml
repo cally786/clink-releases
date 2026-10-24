@@ -1,0 +1,111 @@
+name: Compilar Clink
+
+# Descifra la fuente que publica el repo privado y compila el instalador de un canal.
+# Corre en este repo público (minutos gratuitos). Solo el canal pedido.
+
+on:
+  workflow_dispatch:
+    inputs:
+      canal:
+        description: 'pruebas u oficial'
+        type: choice
+        options: [pruebas, oficial]
+        default: pruebas
+
+# Solo lectura: el job corre npm/cargo/dotnet de terceros y solo sube un artefacto.
+permissions:
+  contents: read
+
+jobs:
+  compilar:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      CANAL: ${{ inputs.canal }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Descifrar la fuente
+        shell: bash
+        env:
+          CLINK_SRC_PASSPHRASE: ${{ secrets.CLINK_SRC_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLINK_SRC_PASSPHRASE \
+            -in fuente/fuente.tar.gz.enc | tar -xz -C src
+
+      # Un paso por canal: cada corrida solo ve el .env del suyo.
+      - name: Escribir el .env de produccion
+        if: env.CANAL == 'oficial'
+        shell: pwsh
+        env:
+          ENV_CANAL: ${{ secrets.ENV_PRODUCCION }}
+        run: Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'src/web-platform/frontend/.env.production') -Value $env:ENV_CANAL -NoNewline
+
+      - name: Escribir el .env de pruebas
+        if: env.CANAL == 'pruebas'
+        shell: pwsh
+        env:
+          ENV_CANAL: ${{ secrets.ENV_PRUEBAS }}
+        run: Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'src/web-platform/frontend/.env.pruebas') -Value $env:ENV_CANAL -NoNewline
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cachés: sin ellas cada corrida pierde ~9 min instalando tauri-cli y ~7 compilando Rust en frío.
+      # Solo corre por workflow_dispatch (y los PR de forks piden aprobación), así que nadie de fuera
+      # escribe en estas cachés.
+      - name: Caché de tauri-cli
+        id: cache-tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri.exe
+          key: tauri-cli-2.12.4-${{ runner.os }}
+
+      - name: Instalar tauri-cli
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --version 2.12.4 --locked
+
+      - name: Caché de Rust (target de la app)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/src-tauri -> target
+          shared-key: clink-desktop
+          cache-on-failure: true
+
+      - name: Caché de node_modules del front
+        uses: actions/cache@v4
+        with:
+          path: src/web-platform/frontend/node_modules
+          key: front-nm-${{ runner.os }}-node20-${{ hashFiles('src/web-platform/frontend/package-lock.json', 'src/web-platform/frontend/package.json') }}
+
+      - name: Caché de NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('src/lan-sync-server/**/*.csproj', 'src/print-agent-csharp/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Compilar instalador
+        shell: pwsh
+        working-directory: ${{ github.workspace }}/src
+        run: |
+          powershell -ExecutionPolicy Bypass -File windows\2-CONSTRUIR.ps1 -Canal $env:CANAL
+          if ($LASTEXITCODE -ne 0) { throw "la compilacion fallo" }
+
+      - name: Subir el instalador como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: clink-${{ env.CANAL }}
+          path: ${{ github.workspace }}/src/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error

@@ -1,0 +1,103 @@
+name: Compilar servidor LAN
+
+# Mismos pasos que release-installers.yml del repo privado (smokes, front de prd, servidor marcado
+# de prd, ZIP + manifiesto), desde la fuente cifrada. NO publica: deja el ZIP y el manifiesto como
+# artefacto y la subida al CDN la hace una persona.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'X.Y.Z o X.Y.Z-pruebas.N'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  compilar:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Descifrar la fuente
+        shell: bash
+        env:
+          CLINK_SRC_PASSPHRASE: ${{ secrets.CLINK_SRC_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLINK_SRC_PASSPHRASE \
+            -in fuente/fuente.tar.gz.enc | tar -xz -C src
+
+      - name: Escribir el .env de produccion
+        shell: pwsh
+        env:
+          ENV_CANAL: ${{ secrets.ENV_PRODUCCION }}
+        run: Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE 'src/web-platform/frontend/.env.production') -Value $env:ENV_CANAL -NoNewline
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/web-platform/frontend/package-lock.json
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache de NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('src/lan-sync-server/**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Compilar, verificar y empaquetar
+        shell: pwsh
+        working-directory: ${{ github.workspace }}/src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Run($what) { & $what; if ($LASTEXITCODE -ne 0) { throw "Fallo: $what" } }
+          if ($env:VERSION -notmatch '^\d+\.\d+\.\d+(-pruebas\.\d+)?$') { throw "Version '$env:VERSION' no es X.Y.Z ni X.Y.Z-pruebas.N" }
+          $numeric = ($env:VERSION -split '-')[0]
+
+          foreach ($p in 'DianInvoiceSmoke/DianInvoiceSmoke', 'CashFundsSmoke/CashFundsSmoke', 'CashSessionRecoverySmoke/CashSessionRecoverySmoke', 'CashSessionRecoveryIntegration/CashSessionRecoveryIntegration') {
+            Run { dotnet run --project "lan-sync-server/smoke/$p.csproj" -c Release }
+          }
+
+          Push-Location web-platform/frontend
+          Run { npm ci --no-audit --no-fund }
+          Run { npm run build }
+          Pop-Location
+
+          Push-Location lan-sync-server/DATAPOS.LANSyncServer
+          Run { dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:ClinkCanalRef=xtmugnmclsuqutenfyav "-p:Version=$env:VERSION" "-p:FileVersion=$numeric" "-p:AssemblyVersion=$numeric" "-p:InformationalVersion=$env:VERSION" -o ../dist-current }
+          Pop-Location
+
+          $exe = 'lan-sync-server/dist-current/Clink-Server.exe'
+          $txt = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))
+          if (-not $txt.Contains([string][char]20 + 'xtmugnmclsuqutenfyav')) { throw 'el servidor no lleva la marca de prd' }
+
+          $wwwroot = 'lan-sync-server/dist-current/wwwroot'
+          if (Test-Path $wwwroot) { Remove-Item -LiteralPath $wwwroot -Recurse -Force }
+          New-Item -ItemType Directory -Path $wwwroot -Force | Out-Null
+          Copy-Item -Path 'web-platform/frontend/dist/*' -Destination $wwwroot -Recurse -Force
+
+          ./lan-sync-server/package-cloudflare.ps1 -PublishDir './lan-sync-server/dist-current' -OutputDir './lan-sync-server/dist' `
+            -ZipName 'Clink-Server.zip' -DownloadUrl "https://downloads.clinkposapp.com/Clink-Server-$env:VERSION.zip" -Version $env:VERSION
+          Get-ChildItem lan-sync-server/dist | Format-Table Name, Length
+          Get-Content lan-sync-server/dist/Clink-Server.latest.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clink-server-${{ env.VERSION }}
+          path: |
+            ${{ github.workspace }}/src/lan-sync-server/dist/Clink-Server.zip
+            ${{ github.workspace }}/src/lan-sync-server/dist/Clink-Server.latest.json
+          if-no-files-found: error
